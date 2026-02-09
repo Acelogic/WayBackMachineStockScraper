@@ -2,11 +2,15 @@
 WayBack Machine Stock Scraper
 
 Recovers historical stock price data for delisted tickers by scraping
-archived Yahoo Finance CSV downloads from the Internet Archive's Wayback Machine.
+archived Yahoo Finance pages from the Internet Archive's Wayback Machine.
 
-The old Yahoo Finance endpoint (real-chart.finance.yahoo.com/table.csv) was
-archived before Yahoo killed it in 2017. This scraper finds those snapshots
-and extracts complete OHLCV + Adj Close data.
+Two strategies are used:
+  1. CSV endpoint: Looks for archived `real-chart.finance.yahoo.com/table.csv`
+     downloads. When available, this gives complete OHLCV history in one shot.
+  2. HTML stitching: When CSV isn't available, scrapes multiple archived snapshots
+     of Yahoo Finance's historical prices page (`/q/hp?s=TICKER`). Each snapshot
+     has ~66 rows from a different time period; stitching them together recovers
+     significant coverage.
 
 Usage:
     python scraper.py YHOO SUNW CTXS          # Fetch specific tickers
@@ -17,7 +21,9 @@ Usage:
 
 import argparse
 import io
+import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -37,6 +43,9 @@ YAHOO_CSV_ENDPOINTS = [
     "chart.finance.yahoo.com/table.csv?s={ticker}",
 ]
 
+# Yahoo Finance HTML history page (for multi-snapshot stitching)
+YAHOO_HTML_ENDPOINT = "finance.yahoo.com/q/hp?s={ticker}"
+
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "data"
 
 HEADERS = {
@@ -54,8 +63,18 @@ NDX_DELISTED_TICKERS = [
     "SPLS", "MEDI", "SUNW",
 ]
 
+# Month abbreviation mapping for Yahoo Finance date format (e.g. "3-Feb-06")
+MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
-def find_wayback_snapshot(ticker: str, endpoint_template: str) -> str | None:
+
+# ---------------------------------------------------------------------------
+# Strategy 1: CSV endpoint scraping (original approach)
+# ---------------------------------------------------------------------------
+
+def find_wayback_snapshot(ticker: str, endpoint_template: str, retries: int = 2) -> str | None:
     """Query the Wayback Machine CDX API to find the best archived snapshot."""
     url = endpoint_template.format(ticker=ticker)
     params = {
@@ -67,34 +86,42 @@ def find_wayback_snapshot(ticker: str, endpoint_template: str) -> str | None:
         "order": "desc",  # Latest snapshots first (most complete data)
     }
 
-    try:
-        r = requests.get(WAYBACK_CDX_URL, params=params, headers=HEADERS, timeout=30)
-        if r.status_code != 200:
+    for attempt in range(retries):
+        try:
+            r = requests.get(WAYBACK_CDX_URL, params=params, headers=HEADERS, timeout=30)
+            if r.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            if len(data) <= 1:  # First row is header
+                return None
+
+            # Pick the snapshot with the largest file size (most complete)
+            best = max(data[1:], key=lambda row: int(row[6]) if row[6].isdigit() else 0)
+            timestamp = best[1]
+            original_url = best[2]
+
+            return f"{WAYBACK_FETCH_URL}/{timestamp}/{original_url}"
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt < retries - 1:
+                time.sleep(10 * (attempt + 1))
+            continue
+        except Exception:
             return None
 
-        data = r.json()
-        if len(data) <= 1:  # First row is header
-            return None
-
-        # Pick the snapshot with the largest file size (most complete)
-        best = max(data[1:], key=lambda row: int(row[6]) if row[6].isdigit() else 0)
-        timestamp = best[1]
-        original_url = best[2]
-
-        return f"{WAYBACK_FETCH_URL}/{timestamp}/{original_url}"
-    except Exception:
-        return None
+    return None
 
 
-def fetch_ticker_data(ticker: str, retries: int = 2) -> pd.DataFrame | None:
+def fetch_csv_data(ticker: str, retries: int = 2) -> pd.DataFrame | None:
     """
-    Fetch historical price data for a ticker from Wayback Machine.
+    Try to fetch complete CSV data from archived Yahoo Finance CSV endpoints.
 
-    Tries multiple archived Yahoo Finance endpoints and returns the
-    result with the most data points.
+    Returns a DataFrame if a CSV archive is found, None otherwise.
     """
     best_df = None
-    best_url = None
 
     for endpoint in YAHOO_CSV_ENDPOINTS:
         snapshot_url = find_wayback_snapshot(ticker, endpoint)
@@ -120,7 +147,6 @@ def fetch_ticker_data(ticker: str, retries: int = 2) -> pd.DataFrame | None:
 
                 if best_df is None or len(df) > len(best_df):
                     best_df = df
-                    best_url = snapshot_url
 
                 break  # Success, no need to retry
             except requests.exceptions.Timeout:
@@ -132,14 +158,238 @@ def fetch_ticker_data(ticker: str, retries: int = 2) -> pd.DataFrame | None:
 
         time.sleep(1)  # Rate limit between endpoints
 
-    if best_df is not None:
-        print(f"  {ticker}: {len(best_df)} rows "
-              f"({best_df['Date'].iloc[0].date()} to {best_df['Date'].iloc[-1].date()})")
-    else:
-        print(f"  {ticker}: not found on Wayback Machine")
-
     return best_df
 
+
+# ---------------------------------------------------------------------------
+# Strategy 2: HTML multi-snapshot stitching
+# ---------------------------------------------------------------------------
+
+def find_html_snapshots(ticker: str, retries: int = 3) -> list[str]:
+    """Find all archived snapshots of the Yahoo Finance history page for a ticker."""
+    url = YAHOO_HTML_ENDPOINT.format(ticker=ticker)
+    params = {
+        "url": url,
+        "output": "json",
+        "fl": "timestamp,original,length,statuscode",
+        "filter": "statuscode:200",
+        "limit": 100,
+    }
+
+    for attempt in range(retries):
+        try:
+            r = requests.get(WAYBACK_CDX_URL, params=params, headers=HEADERS, timeout=60)
+            if r.status_code == 429:
+                wait = 15 * (attempt + 1)
+                print(f"    CDX rate limited, waiting {wait}s...", flush=True)
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                return []
+
+            data = r.json()
+            if len(data) <= 1:
+                return []
+
+            # Return list of (timestamp, original_url) sorted by timestamp
+            snapshots = []
+            for row in data[1:]:
+                timestamp, original_url = row[0], row[1]
+                # Skip tiny pages (< 4KB likely error pages)
+                length = int(row[2]) if row[2].isdigit() else 0
+                if length < 4000:
+                    continue
+                snapshots.append((timestamp, original_url))
+
+            return snapshots
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"    CDX connection error, retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+            continue
+        except Exception:
+            return []
+
+    return []
+
+
+def parse_yahoo_html_table(html: str) -> list[dict]:
+    """
+    Parse OHLCV data from an archived Yahoo Finance historical prices HTML page.
+
+    The old Yahoo Finance layout uses `yfnc_tabledata1` CSS class for data cells.
+    Each row has 7 cells: Date, Open, High, Low, Close, Volume, Adj Close.
+    """
+    cells = re.findall(r'class="yfnc_tabledata1"[^>]*>([^<]+)</td>', html)
+
+    if len(cells) < 7:
+        return []
+
+    rows = []
+    for i in range(0, len(cells) - 6, 7):
+        date_str = cells[i].strip()
+        try:
+            # Parse Yahoo date format: "3-Feb-06" or "15-Jan-04"
+            parts = date_str.split("-")
+            if len(parts) != 3:
+                continue
+            day = int(parts[0])
+            month = MONTH_MAP.get(parts[1])
+            year = int(parts[2])
+            if month is None:
+                continue
+            # Handle 2-digit years
+            if year < 100:
+                year += 2000 if year < 50 else 1900
+
+            # Parse numeric values (remove commas from volume)
+            open_val = float(cells[i + 1].strip().replace(",", ""))
+            high_val = float(cells[i + 2].strip().replace(",", ""))
+            low_val = float(cells[i + 3].strip().replace(",", ""))
+            close_val = float(cells[i + 4].strip().replace(",", ""))
+            volume_str = cells[i + 5].strip().replace(",", "")
+            volume_val = int(volume_str) if volume_str.isdigit() else 0
+            adj_close_val = float(cells[i + 6].strip().replace(",", ""))
+
+            rows.append({
+                "Date": pd.Timestamp(year=year, month=month, day=day),
+                "Open": open_val,
+                "High": high_val,
+                "Low": low_val,
+                "Close": close_val,
+                "Volume": volume_val,
+                "Adj Close": adj_close_val,
+            })
+        except (ValueError, IndexError):
+            continue
+
+    return rows
+
+
+def fetch_html_stitched_data(
+    ticker: str,
+    delay: float = 2.0,
+    max_snapshots: int = 50,
+) -> pd.DataFrame | None:
+    """
+    Recover price data by stitching together multiple archived HTML snapshots.
+
+    Each Yahoo Finance history page shows ~66 rows (one page of data). Different
+    snapshots from different dates show different time windows. By downloading
+    multiple snapshots and merging them, we can recover significantly more data.
+    """
+    snapshots = find_html_snapshots(ticker)
+    if not snapshots:
+        return None
+
+    print(f"    found {len(snapshots)} HTML snapshots, fetching...", end="", flush=True)
+
+    all_rows = []
+    fetched = 0
+
+    consecutive_errors = 0
+    for timestamp, original_url in snapshots[:max_snapshots]:
+        fetch_url = f"{WAYBACK_FETCH_URL}/{timestamp}/{original_url}"
+
+        try:
+            r = requests.get(fetch_url, headers=HEADERS, timeout=60)
+            if r.status_code == 429:
+                print("R", end="", flush=True)
+                time.sleep(15)
+                consecutive_errors += 1
+                if consecutive_errors >= 5:
+                    print(" (rate limited, stopping)", flush=True)
+                    break
+                continue
+            if r.status_code != 200:
+                continue
+
+            rows = parse_yahoo_html_table(r.text)
+            if rows:
+                all_rows.extend(rows)
+                fetched += 1
+                consecutive_errors = 0
+                print(".", end="", flush=True)
+            else:
+                print("x", end="", flush=True)
+
+        except requests.exceptions.ConnectionError:
+            print("C", end="", flush=True)
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                print(" (connection errors, backing off 30s)", flush=True)
+                time.sleep(30)
+                consecutive_errors = 0
+        except requests.exceptions.Timeout:
+            print("T", end="", flush=True)
+            consecutive_errors += 1
+        except Exception:
+            print("!", end="", flush=True)
+
+        time.sleep(delay)
+
+    print()  # Newline after progress dots
+
+    if not all_rows:
+        return None
+
+    # Combine all rows into a DataFrame, deduplicate by date
+    df = pd.DataFrame(all_rows)
+    df = df.drop_duplicates(subset=["Date"], keep="first")
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    print(f"    stitched {fetched}/{len(snapshots)} snapshots → {len(df)} unique rows")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Combined fetch: try CSV first, fall back to HTML stitching
+# ---------------------------------------------------------------------------
+
+def fetch_ticker_data(ticker: str, delay: float = 2.0) -> pd.DataFrame | None:
+    """
+    Fetch historical price data for a ticker from Wayback Machine.
+
+    Strategy:
+      1. Try CSV endpoints (gives complete data if available)
+      2. Fall back to HTML multi-snapshot stitching
+    """
+    # Strategy 1: CSV endpoint
+    csv_df = fetch_csv_data(ticker)
+    if csv_df is not None and len(csv_df) > 100:
+        print(f"  {ticker}: {len(csv_df)} rows via CSV "
+              f"({csv_df['Date'].iloc[0].date()} to {csv_df['Date'].iloc[-1].date()})")
+        return csv_df
+
+    # Strategy 2: HTML stitching
+    print(f"  {ticker}: no CSV archive, trying HTML stitching...")
+    html_df = fetch_html_stitched_data(ticker, delay=delay)
+
+    if html_df is not None and not html_df.empty:
+        source = "HTML"
+        # If CSV had some data but less, pick the better one
+        if csv_df is not None and len(csv_df) > len(html_df):
+            html_df = csv_df
+            source = "CSV"
+        print(f"  {ticker}: {len(html_df)} rows via {source} "
+              f"({html_df['Date'].iloc[0].date()} to {html_df['Date'].iloc[-1].date()})")
+        return html_df
+
+    # If CSV had some data (< 100 rows), still return it
+    if csv_df is not None and not csv_df.empty:
+        print(f"  {ticker}: {len(csv_df)} rows via CSV "
+              f"({csv_df['Date'].iloc[0].date()} to {csv_df['Date'].iloc[-1].date()})")
+        return csv_df
+
+    print(f"  {ticker}: not found on Wayback Machine")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# File I/O and orchestration
+# ---------------------------------------------------------------------------
 
 def save_ticker(ticker: str, df: pd.DataFrame, output_dir: Path) -> Path:
     """Save ticker data to CSV."""
@@ -153,7 +403,6 @@ def load_manifest(output_dir: Path) -> dict:
     """Load existing manifest of previously scraped tickers."""
     manifest_path = output_dir / "manifest.json"
     if manifest_path.exists():
-        import json
         with open(manifest_path) as f:
             return json.load(f)
     return {}
@@ -161,7 +410,6 @@ def load_manifest(output_dir: Path) -> dict:
 
 def save_manifest(manifest: dict, output_dir: Path):
     """Save manifest of scraped tickers."""
-    import json
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -192,12 +440,12 @@ def scrape_tickers(
         # Skip if already scraped
         if skip_existing and ticker in manifest:
             existing_path = output_dir / f"{ticker}.csv"
-            if existing_path.exists():
+            if existing_path.exists() and manifest[ticker].get("rows", 0) > 0:
                 print(f"  {ticker}: skipping (already scraped, {manifest[ticker].get('rows', '?')} rows)")
                 results["skipped"].append(ticker)
                 continue
 
-        df = fetch_ticker_data(ticker)
+        df = fetch_ticker_data(ticker, delay=delay)
 
         if df is not None and not df.empty:
             path = save_ticker(ticker, df, output_dir)
@@ -216,12 +464,12 @@ def scrape_tickers(
         # Save manifest after each ticker (crash-safe)
         save_manifest(manifest, output_dir)
 
-        # Rate limiting
+        # Rate limiting between tickers
         if i < len(tickers) - 1:
             time.sleep(delay)
 
     # Summary
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"Results: {len(results['found'])} found, "
           f"{len(results['not_found'])} not found, "
           f"{len(results['skipped'])} skipped")

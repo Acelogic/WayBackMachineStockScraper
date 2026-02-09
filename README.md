@@ -1,6 +1,6 @@
 # WayBack Machine Stock Scraper
 
-Recover historical stock price data for **delisted tickers** by scraping archived Yahoo Finance CSV downloads from the Internet Archive's [Wayback Machine](https://web.archive.org/).
+Recover historical stock price data for **delisted tickers** by scraping archived Yahoo Finance pages from the Internet Archive's [Wayback Machine](https://web.archive.org/).
 
 ## The Problem
 
@@ -8,17 +8,44 @@ Free financial data APIs (Yahoo Finance, Stooq, Investing.com) remove delisted s
 
 ## The Solution
 
-Before Yahoo killed their CSV download endpoint in 2017, the Wayback Machine archived many of these files. This scraper finds those snapshots and extracts complete OHLCV + Adjusted Close data — often spanning the **full lifetime** of the company.
+Two recovery strategies, tried in order:
 
-**Proof of concept:** Yahoo (YHOO) — 5,142 rows from IPO (1996) through delisting (2016), recovered from a single Wayback snapshot.
+1. **CSV endpoint** (best case): Before Yahoo killed their CSV download endpoint in 2017, the Wayback Machine archived many of these files. When available, this gives complete OHLCV history in one shot — often spanning the full lifetime of the company.
+
+2. **HTML multi-snapshot stitching** (fallback): When no CSV archive exists, the scraper finds all archived snapshots of Yahoo Finance's historical prices page (`/q/hp?s=TICKER`). Each snapshot shows ~66 rows from a different time period. By downloading and merging multiple snapshots, the scraper stitches together hundreds of rows of coverage.
+
+**Results from testing:**
+
+| Ticker | Rows | Strategy | Date Range |
+|--------|------|----------|------------|
+| YHOO | 5,142 | CSV | 1996-04 to 2016-09 |
+| JNPR | 651 | HTML stitch (11 snapshots) | 2003-09 to 2009-07 |
+| SUNW | 639 | HTML stitch (16 snapshots) | 2003-07 to 2007-02 |
+| XMSR | 623 | HTML stitch (11 snapshots) | 2003-08 to 2008-03 |
+| APOL | 567 | HTML stitch (12 snapshots) | 2004-08 to 2009-02 |
+| MEDI | 432 | HTML stitch (10 snapshots) | 2004-06 to 2007-05 |
+| PIXR | 304 | HTML stitch (5 snapshots) | 2003-07 to 2005-11 |
+| GENZ | 198 | HTML stitch (3 snapshots) | 2003-07 to 2004-08 |
 
 ## How It Works
 
+### Strategy 1: CSV Endpoint
 1. Queries the [Wayback CDX API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server) to find archived snapshots of `real-chart.finance.yahoo.com/table.csv?s=TICKER`
-2. Selects the snapshot with the most data (largest file size)
-3. Downloads and parses the archived CSV
-4. Saves clean OHLCV data to `data/{TICKER}.csv`
-5. Optionally merges recovered data into an existing price cache
+2. Tries multiple archived endpoints (`real-chart`, `ichart`, `chart`)
+3. Selects the snapshot with the most data (largest file size)
+4. Downloads and parses the archived CSV
+
+### Strategy 2: HTML Multi-Snapshot Stitching
+1. Queries CDX API for all archived snapshots of `finance.yahoo.com/q/hp?s=TICKER`
+2. Downloads each snapshot (typically 8-28 archived pages per ticker)
+3. Parses the `yfnc_tabledata1` HTML table — each page has ~66 rows of OHLCV data
+4. Deduplicates by date and merges all snapshots into a single timeline
+5. Handles Wayback Machine rate limiting with automatic retries and backoff
+
+### Output
+- Saves clean OHLCV data to `data/{TICKER}.csv`
+- Tracks progress in `data/manifest.json` (crash-safe, saves after each ticker)
+- Optionally merges recovered data into an existing price cache
 
 ## Installation
 
@@ -55,6 +82,11 @@ python scraper.py YHOO --output-dir ./my_data
 python scraper.py YHOO --force
 ```
 
+### Adjust rate limiting (default 2s between requests)
+```bash
+python scraper.py --all --delay 5.0  # Be more conservative
+```
+
 ### Merge into NDX simulation price cache
 ```bash
 python scraper.py --merge --output-dir ./data
@@ -86,6 +118,16 @@ A `manifest.json` tracks what's been scraped:
 }
 ```
 
+## Progress Indicators
+
+During HTML stitching, progress is shown with dot characters:
+- `.` — snapshot fetched and parsed successfully
+- `x` — page fetched but no table data found (newer Yahoo layout)
+- `C` — connection error (Wayback rate limiting)
+- `T` — timeout
+- `R` — HTTP 429 rate limited, backing off
+- `!` — unexpected error
+
 ## Known NDX Delisted Tickers
 
 The scraper includes a built-in list of 51 delisted Nasdaq-100 tickers from the 2000-2010 era, sorted by weight impact:
@@ -99,14 +141,14 @@ The scraper includes a built-in list of 51 delisted Nasdaq-100 tickers from the 
 | SUNW | Sun Microsystems | Acquired by Oracle 2010 |
 | PIXR | Pixar | Acquired by Disney 2006 |
 | XMSR | XM Satellite Radio | Merged with Sirius 2008 |
-| ... | [48 more] | See `NDX_DELISTED_TICKERS` in scraper.py |
+| ... | [44 more] | See `NDX_DELISTED_TICKERS` in scraper.py |
 
 ## Limitations
 
-- **Wayback Machine availability**: Not all tickers were archived. Coverage depends on whether someone/something crawled the Yahoo Finance CSV endpoint for that specific ticker before 2017.
-- **Rate limiting**: The Wayback Machine is a free public service. The scraper includes configurable delays (default 2s) between requests. Be respectful.
-- **Snapshot age**: Data ends at the date of the last Wayback snapshot (typically 2014-2017), not present day. This is fine for delisted stocks since they stopped trading before that.
-- **Adjusted prices**: The `Adj Close` column reflects adjustments as of the snapshot date, not today. For stocks that were later acquired at a premium, the final adjustment may differ from what Yahoo would show today (if they still had the data).
+- **Wayback Machine coverage varies**: CSV archives give complete history but are rare (~5% of tickers). HTML stitching is more common (~50% of tickers) but gives partial coverage (typically 200-700 rows from a ~4-year window).
+- **Rate limiting**: The Wayback Machine is a free public service. The scraper includes automatic retry/backoff logic, but aggressive scraping will result in temporary blocks. Use `--delay 5.0` or higher for large batches.
+- **Snapshot age**: Data ends at the date of the last Wayback snapshot (typically 2004-2009 for HTML, 2014-2017 for CSV). This is fine for delisted stocks since they stopped trading before that.
+- **Adjusted prices**: The `Adj Close` column reflects adjustments as of the snapshot date, not today. For stocks that were later acquired at a premium, the final adjustment may differ.
 
 ## Integration with NDX Simulation
 
@@ -120,7 +162,7 @@ python scraper.py --all
 python scraper.py --merge
 ```
 
-This can improve early-period (2000-2010) coverage from ~80% to potentially 90%+, making the 25-year backtest significantly more accurate.
+This improves early-period (2000-2010) data coverage, making the 25-year backtest significantly more accurate for periods when many Nasdaq-100 constituents have since been delisted.
 
 ## License
 
